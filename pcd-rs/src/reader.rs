@@ -55,9 +55,28 @@ where
     record_count: usize,
     finished: bool,
     reader: R,
-    #[cfg(feature = "binary_compressed")]
-    decompressed_chunk: std::collections::VecDeque<T>,
     _phantom: PhantomData<T>,
+
+    /// Decompressed chunk. Used only for binary compressed data.
+    /// Each field stores all values of a field in the file.
+    ///
+    /// For example, the data:
+    /// ```ignore
+    /// DATA ascii
+    /// x y z rgb
+    /// x y z rgb
+    /// x y z rgb
+    /// ```
+    /// Stored in `decompressed_chunk` as:
+    /// ```ignore
+    /// DATA binary_compressed
+    /// x x x
+    /// y y y
+    /// z z z
+    /// rgb rgb rgb rgb
+    /// ```
+    #[cfg(feature = "binary_compressed")]
+    decompressed_chunk: Option<Vec<crate::Field>>,
 }
 
 impl<'a, Record> Reader<Record, BufReader<Cursor<&'a [u8]>>>
@@ -122,7 +141,7 @@ where
             record_count: 0,
             finished: false,
             #[cfg(feature = "binary_compressed")]
-            decompressed_chunk: std::collections::VecDeque::new(),
+            decompressed_chunk: None,
             _phantom: PhantomData,
         };
 
@@ -168,24 +187,35 @@ where
             #[cfg(feature = "binary_compressed")]
             DataKind::BinaryCompressed => {
                 let mut read_result: Option<Result<Record>> = None;
-                if self.decompressed_chunk.is_empty() {
-                    if let Err(e) = Record::read_compressed_chunk(
-                        &mut self.reader,
-                        &self.meta,
-                        &mut self.decompressed_chunk,
-                    ) {
-                        read_result = Some(Err(e));
+                if self.decompressed_chunk.is_none() {
+                    match Record::read_compressed_chunk(&mut self.reader, &self.meta) {
+                        Ok(fields_data) => {
+                            self.decompressed_chunk = Some(fields_data);
+                        }
+                        Err(e) => {
+                            read_result = Some(Err(e));
+                        }
                     }
                 }
                 match read_result {
                     Some(err) => err,
-                    None => match Record::read_decompressed_chunk(&mut self.decompressed_chunk) {
-                        Some(record) => Ok(record),
-                        None => {
-                            self.finished = true;
-                            return None;
+                    None => {
+                        let fields_data = self
+                            .decompressed_chunk
+                            .as_ref()
+                            .expect("decompressed_chunk is initialized");
+                        match Record::read_decompressed_chunk(
+                            fields_data.as_slice(),
+                            self.record_count,
+                            &self.meta.field_defs,
+                        ) {
+                            Some(record) => Ok(record),
+                            None => {
+                                self.finished = true;
+                                return None;
+                            }
                         }
-                    },
+                    }
                 }
             }
         };

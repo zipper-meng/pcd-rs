@@ -24,8 +24,6 @@ pub enum Error {
     TextTokenMismatchError { expect: usize, found: usize },
     #[error("Invalid argument: {desc}")]
     InvalidArgumentError { desc: String },
-    #[error("decompressing error: {desc}")]
-    DecompressionError { desc: String },
 }
 
 impl Error {
@@ -69,12 +67,6 @@ impl Error {
     pub fn new_invalid_argument_error(desc: &str) -> Error {
         Error::InvalidArgumentError {
             desc: desc.to_owned(),
-        }
-    }
-
-    pub fn new_decompression_error(desc: lzf::LzfError) -> Error {
-        Error::DecompressionError {
-            desc: desc.to_string(),
         }
     }
 }

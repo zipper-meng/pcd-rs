@@ -51,6 +51,8 @@ use crate::{
     record::{DynRecord, PcdSerialize},
 };
 use anyhow::{bail, ensure, Result};
+#[cfg(feature = "binary_compressed")]
+use byteorder::WriteBytesExt;
 use std::{
     collections::HashSet,
     fs::File,
@@ -261,10 +263,76 @@ where
             DataKind::Binary => record.write_chunk(&mut self.writer, &self.record_spec)?,
             DataKind::Ascii => record.write_line(&mut self.writer, &self.record_spec)?,
             #[cfg(feature = "binary_compressed")]
-            DataKind::BinaryCompressed => todo!("implement write binary compressed data"),
+            DataKind::BinaryCompressed => {
+                bail!("call `write_binary_compressed()` to write in this mode")
+            }
         }
 
         self.num_records += 1;
+        Ok(())
+    }
+
+    /// Writes a new point to PCD data.
+    #[cfg(feature = "binary_compressed")]
+    pub fn write_binary_compressed(&mut self, records: &[Record]) -> Result<()> {
+        if !matches!(self.data_kind, DataKind::BinaryCompressed) {
+            bail!("call `push()` to write in this mode");
+        }
+
+        let record_bytes_num: u64 = self
+            .record_spec
+            .iter()
+            .map(|f| {
+                f.count
+                    * match f.kind {
+                        ValueKind::U8 => 1_u64,
+                        ValueKind::U16 => 2,
+                        ValueKind::U32 => 4,
+                        ValueKind::I8 => 1,
+                        ValueKind::I16 => 2,
+                        ValueKind::I32 => 4,
+                        ValueKind::F32 => 4,
+                        ValueKind::F64 => 8,
+                    }
+            })
+            .sum();
+
+        let mut binary_data_writer = BufWriter::new(std::io::Cursor::new(Vec::with_capacity(
+            record_bytes_num as usize,
+        )));
+        for field_index in 0..self.record_spec.len() {
+            for record in records {
+                record.write_one_field(&mut binary_data_writer, &self.record_spec, field_index)?;
+            }
+        }
+        let decompressed_data = binary_data_writer.buffer();
+        let decompressed_len = decompressed_data.len() as u32;
+
+        // Compressed data may be larger than the original data.
+        let mut compressed_buffer = vec![0_u8; (decompressed_len + 3) as usize];
+        let compressed_len = unsafe {
+            let compressed_buffer_used = lzf_sys::lzf_compress(
+                decompressed_data.as_ptr() as *const std::ffi::c_void,
+                decompressed_len as std::ffi::c_uint,
+                compressed_buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                compressed_buffer.len() as std::ffi::c_uint,
+            );
+            if compressed_buffer_used == 0 {
+                bail!(
+                    "Failed in lzf_compression, the buffer ({}) is too small",
+                    compressed_buffer.len(),
+                );
+            }
+            compressed_buffer_used
+        };
+
+        self.writer
+            .write_u32::<byteorder::LittleEndian>(compressed_len)?;
+        self.writer
+            .write_u32::<byteorder::LittleEndian>(decompressed_len)?;
+        self.writer.write_all(&compressed_buffer)?;
+
+        self.num_records = records.len();
         Ok(())
     }
 }

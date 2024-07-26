@@ -104,3 +104,54 @@ fn write_binary_untyped() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+#[cfg(feature = "binary_compressed")]
+fn write_binary_compressed_untyped() -> Result<()> {
+    let path = "test_files/dump_binary_compressed_untyped.pcd";
+
+    let dump_points = vec![
+        DynRecord(vec![
+            Field::F32(vec![3.14159]),
+            Field::U8(vec![2, 1, 7]),
+            Field::I32(vec![-5]),
+        ]),
+        DynRecord(vec![
+            Field::F32(vec![-0.0]),
+            Field::U8(vec![254, 6, 98]),
+            Field::I32(vec![7]),
+        ]),
+        DynRecord(vec![
+            Field::F32(vec![5.6]),
+            Field::U8(vec![4, 0, 111]),
+            Field::I32(vec![-100000]),
+        ]),
+    ];
+
+    let schema = Schema::from_iter([
+        ("x", ValueKind::F32, 1),
+        ("y", ValueKind::U8, 3),
+        ("z", ValueKind::I32, 1),
+    ]);
+
+    let mut writer = WriterInit {
+        width: 300,
+        height: 1,
+        viewpoint: Default::default(),
+        data_kind: DataKind::BinaryCompressed,
+        schema: Some(schema),
+    }
+    .create(path)?;
+
+    writer.write_binary_compressed(&dump_points).unwrap();
+
+    writer.finish()?;
+
+    let reader = Reader::open(path)?;
+    let load_points: Vec<DynRecord> = reader.try_collect()?;
+
+    assert_eq!(dump_points, load_points);
+    std::fs::remove_file(path)?;
+
+    Ok(())
+}

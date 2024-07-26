@@ -68,8 +68,6 @@ use crate::{
 use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use num_traits::NumCast;
-#[cfg(feature = "binary_compressed")]
-use std::collections::VecDeque;
 use std::io::prelude::*;
 
 /// [PcdDeserialize](crate::record::PcdDeserialize) is analogous to a _point_ returned from a reader.
@@ -86,13 +84,13 @@ pub trait PcdDeserialize: Sized {
     fn read_line<R: BufRead>(reader: &mut R, field_defs: &Schema) -> Result<Self>;
 
     #[cfg(feature = "binary_compressed")]
-    fn read_compressed_chunk<R: BufRead>(
-        reader: &mut R,
-        pcd_meta: &PcdMeta,
-        chunks: &mut VecDeque<Self>,
-    ) -> Result<()>;
+    fn read_compressed_chunk<R: BufRead>(reader: &mut R, pcd_meta: &PcdMeta) -> Result<Vec<Field>>;
     #[cfg(feature = "binary_compressed")]
-    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self>;
+    fn read_decompressed_chunk(
+        fields_data: &[Field],
+        index: usize,
+        field_defs: &Schema,
+    ) -> Option<Self>;
 }
 
 /// [PcdSerialize](crate::record::PcdSerialize) is analogous to a _point_ written by a writer.
@@ -107,6 +105,14 @@ pub trait PcdSerialize: Sized {
     fn write_spec() -> Schema;
     fn write_chunk<R: Write + Seek>(&self, writer: &mut R, spec: &Schema) -> Result<()>;
     fn write_line<R: Write + Seek>(&self, writer: &mut R, spec: &Schema) -> Result<()>;
+
+    #[cfg(feature = "binary_compressed")]
+    fn write_one_field<R: Write + Seek>(
+        &self,
+        writer: &mut R,
+        spec: &Schema,
+        field_index: usize,
+    ) -> Result<()>;
 }
 
 // Runtime record types
@@ -414,6 +420,77 @@ impl PcdSerialize for DynRecord {
 
         Ok(())
     }
+
+    #[cfg(feature = "binary_compressed")]
+    fn write_one_field<R: Write + Seek>(
+        &self,
+        writer: &mut R,
+        spec: &Schema,
+        field_index: usize,
+    ) -> Result<()> {
+        if !self.is_schema_consistent(spec) {
+            bail!("The content of record does not match the writer schema.");
+        }
+
+        if field_index > self.0.len() {
+            bail!("Field index {field_index} out of range {}.", self.0.len());
+        }
+
+        use Field as F;
+
+        match &self.0[field_index] {
+            F::I8(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_i8(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            F::I16(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_i16::<LittleEndian>(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            F::I32(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_i32::<LittleEndian>(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            F::U8(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_u8(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            F::U16(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_u16::<LittleEndian>(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            F::U32(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_u32::<LittleEndian>(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            F::F32(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_f32::<LittleEndian>(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            F::F64(values) => {
+                values
+                    .iter()
+                    .map(|val| Ok(writer.write_f64::<LittleEndian>(*val)?))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl PcdDeserialize for DynRecord {
@@ -573,11 +650,7 @@ impl PcdDeserialize for DynRecord {
     }
 
     #[cfg(feature = "binary_compressed")]
-    fn read_compressed_chunk<R: BufRead>(
-        reader: &mut R,
-        pcd_meta: &PcdMeta,
-        chunks: &mut VecDeque<Self>,
-    ) -> Result<()> {
+    fn read_compressed_chunk<R: BufRead>(reader: &mut R, pcd_meta: &PcdMeta) -> Result<Vec<Field>> {
         let mut u32_bytes = [0_u8; 4];
         reader.read_exact(&mut u32_bytes)?;
         let compressed_len = u32::from_le_bytes(u32_bytes) as usize;
@@ -585,87 +658,181 @@ impl PcdDeserialize for DynRecord {
         let decompressed_len = u32::from_le_bytes(u32_bytes) as usize;
 
         if compressed_len == 0 || decompressed_len == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
-        let mut compressed_data = vec![0_u8; decompressed_len];
-        reader.read_exact(&mut compressed_data[..compressed_len])?;
-        let decompressed_data =
-            lzf::decompress(&compressed_data[..compressed_len], decompressed_len)
-                .map_err(|e| Error::new_decompression_error(e))?;
-        let mut reader = std::io::BufReader::new(std::io::Cursor::new(decompressed_data));
+        let mut reader = {
+            let mut compressed_data = vec![0_u8; compressed_len];
+            reader.read_exact(&mut compressed_data)?;
+
+            let mut decompressed_data = vec![0_u8; decompressed_len];
+            unsafe {
+                let real_decompressed_len = lzf_sys::lzf_decompress(
+                    compressed_data.as_ptr() as *const std::ffi::c_void,
+                    compressed_len as std::ffi::c_uint,
+                    decompressed_data.as_mut_ptr() as *mut std::ffi::c_void,
+                    decompressed_len as std::ffi::c_uint,
+                );
+                if real_decompressed_len != decompressed_len as u32 {
+                    bail!(
+                        "Failed in lzf_decompression, length mismatch: {real_decompressed_len} != {decompressed_len}"
+                    );
+                }
+            }
+
+            std::io::BufReader::new(std::io::Cursor::new(decompressed_data))
+        };
 
         use Field as F;
         use ValueKind as K;
 
-        for _ in 0..pcd_meta.width {
-            let mut fields = Vec::with_capacity(pcd_meta.width as usize);
+        let mut fields = Vec::with_capacity(pcd_meta.field_defs.len());
 
-            for FieldDef { kind, count, .. } in pcd_meta.field_defs.iter() {
-                let counter = 0..*count;
+        for FieldDef { kind, count, .. } in pcd_meta.field_defs.iter() {
+            let mut field = match kind {
+                K::U8 => F::U8(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+                K::U16 => F::U16(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+                K::U32 => F::U32(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+                K::I8 => F::I8(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+                K::I16 => F::I16(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+                K::I32 => F::I32(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+                K::F32 => F::F32(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+                K::F64 => F::F64(Vec::with_capacity((pcd_meta.num_points * *count) as usize)),
+            };
 
-                let field = match kind {
-                    K::I8 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_i8()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::I8(values)
+            for _ in 0..pcd_meta.num_points {
+                match &mut field {
+                    F::I8(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_i8()?);
+                        }
                     }
-                    K::I16 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_i16::<LittleEndian>()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::I16(values)
+                    F::I16(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_i16::<LittleEndian>()?);
+                        }
                     }
-                    K::I32 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_i32::<LittleEndian>()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::I32(values)
+                    F::I32(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_i32::<LittleEndian>()?);
+                        }
                     }
-                    K::U8 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_u8()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::U8(values)
+                    F::U8(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_u8()?);
+                        }
                     }
-                    K::U16 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_u16::<LittleEndian>()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::U16(values)
+                    F::U16(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_u16::<LittleEndian>()?);
+                        }
                     }
-                    K::U32 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_u32::<LittleEndian>()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::U32(values)
+                    F::U32(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_u32::<LittleEndian>()?);
+                        }
                     }
-                    K::F32 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_f32::<LittleEndian>()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::F32(values)
+                    F::F32(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_f32::<LittleEndian>()?);
+                        }
                     }
-                    K::F64 => {
-                        let values = counter
-                            .map(|_| Ok(reader.read_f64::<LittleEndian>()?))
-                            .collect::<Result<Vec<_>>>()?;
-                        F::F64(values)
+                    F::F64(field_data) => {
+                        for _ in 0..*count {
+                            field_data.push(reader.read_f64::<LittleEndian>()?);
+                        }
                     }
-                };
-                fields.push(field);
+                }
             }
 
-            chunks.push_back(DynRecord(fields));
+            fields.push(field);
         }
 
-        Ok(())
+        Ok(fields)
     }
 
     #[cfg(feature = "binary_compressed")]
-    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
-        chunks.pop_front()
+    fn read_decompressed_chunk(
+        fields_data: &[Field],
+        index: usize,
+        field_defs: &Schema,
+    ) -> Option<Self> {
+        if fields_data.is_empty() {
+            return None;
+        }
+
+        let mut record_fields = Vec::with_capacity(field_defs.len());
+
+        for (field_def, field) in field_defs.iter().zip(fields_data.iter()) {
+            use Field as F;
+
+            let start_off = index * field_def.count as usize;
+            let end_off = start_off + field_def.count as usize;
+            let counter = start_off..end_off;
+
+            let row_filed = match field {
+                F::I8(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::I8(values)
+                }
+                F::I16(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::I16(values)
+                }
+                F::I32(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::I32(values)
+                }
+                F::U8(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::U8(values)
+                }
+                F::U16(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::U16(values)
+                }
+                F::U32(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::U32(values)
+                }
+                F::F32(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::F32(values)
+                }
+                F::F64(field_values) => {
+                    if field_values.len() < end_off {
+                        return None;
+                    }
+                    let values = counter.map(|i| field_values[i]).collect::<Vec<_>>();
+                    F::F64(values)
+                }
+            };
+
+            record_fields.push(row_filed);
+        }
+
+        Some(Self(record_fields))
     }
 }
 
@@ -693,16 +860,20 @@ impl PcdDeserialize for u8 {
 
     #[cfg(feature = "binary_compressed")]
     fn read_compressed_chunk<R: BufRead>(
-        reader: &mut R,
-        pcd_meta: &PcdMeta,
-        chunks: &mut VecDeque<Self>,
-    ) -> Result<()> {
-        todo!("implement binary compressed")
+        _reader: &mut R,
+        _pcd_meta: &PcdMeta,
+    ) -> Result<Vec<Field>> {
+        bail!("Only support binary_compressed data")
     }
 
     #[cfg(feature = "binary_compressed")]
-    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
-        todo!("implement binary compressed")
+    fn read_decompressed_chunk(
+        _fields_data: &[Field],
+        _index: usize,
+        _field_defs: &Schema,
+    ) -> Option<Self> {
+        // Only support binary_compressed data
+        None
     }
 }
 
@@ -728,16 +899,20 @@ impl PcdDeserialize for i8 {
 
     #[cfg(feature = "binary_compressed")]
     fn read_compressed_chunk<R: BufRead>(
-        reader: &mut R,
-        pcd_meta: &PcdMeta,
-        chunks: &mut VecDeque<Self>,
-    ) -> Result<()> {
-        todo!("implement binary compressed")
+        _reader: &mut R,
+        _pcd_meta: &PcdMeta,
+    ) -> Result<Vec<Field>> {
+        bail!("Only support binary_compressed data")
     }
 
     #[cfg(feature = "binary_compressed")]
-    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
-        todo!("implement binary compressed")
+    fn read_decompressed_chunk(
+        _fields_data: &[Field],
+        _index: usize,
+        _field_defs: &Schema,
+    ) -> Option<Self> {
+        // Only support binary_compressed data
+        None
     }
 }
 
@@ -765,16 +940,20 @@ macro_rules! impl_primitive {
 
             #[cfg(feature = "binary_compressed")]
             fn read_compressed_chunk<R: BufRead>(
-                reader: &mut R,
-                pcd_meta: &PcdMeta,
-                chunks: &mut VecDeque<Self>,
-            ) -> Result<()> {
-                todo!("implement binary compressed")
+                _reader: &mut R,
+                _pcd_meta: &PcdMeta,
+            ) -> Result<Vec<Field>> {
+                bail!("Only support binary_compressed data")
             }
 
             #[cfg(feature = "binary_compressed")]
-            fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
-                todo!("implement binary compressed")
+            fn read_decompressed_chunk(
+                _fields_data: &[Field],
+                _index: usize,
+                _field_defs: &Schema,
+            ) -> Option<Self> {
+                // Only support binary_compressed data
+                None
             }
         }
     };
