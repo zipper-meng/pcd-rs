@@ -45,6 +45,8 @@ impl Default for ViewPoint {
 pub enum DataKind {
     Ascii,
     Binary,
+    #[cfg(feature = "binary_compressed")]
+    BinaryCompressed,
 }
 
 /// The enum specifies one of signed, unsigned integers, and floating point number type to the field.

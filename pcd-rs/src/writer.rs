@@ -219,6 +219,8 @@ where
             match data_kind {
                 DataKind::Binary => writeln!(writer, "DATA binary")?,
                 DataKind::Ascii => writeln!(writer, "DATA ascii")?,
+                #[cfg(feature = "binary_compressed")]
+                DataKind::BinaryCompressed => writeln!(writer, "DATA binary_compressed")?,
             }
 
             (points_arg_begin, points_arg_width)
@@ -258,6 +260,8 @@ where
         match self.data_kind {
             DataKind::Binary => record.write_chunk(&mut self.writer, &self.record_spec)?,
             DataKind::Ascii => record.write_line(&mut self.writer, &self.record_spec)?,
+            #[cfg(feature = "binary_compressed")]
+            DataKind::BinaryCompressed => todo!("implement write binary compressed data"),
         }
 
         self.num_records += 1;

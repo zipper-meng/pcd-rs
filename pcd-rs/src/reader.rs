@@ -55,6 +55,8 @@ where
     record_count: usize,
     finished: bool,
     reader: R,
+    #[cfg(feature = "binary_compressed")]
+    decompressed_chunk: std::collections::VecDeque<T>,
     _phantom: PhantomData<T>,
 }
 
@@ -119,6 +121,8 @@ where
             reader,
             record_count: 0,
             finished: false,
+            #[cfg(feature = "binary_compressed")]
+            decompressed_chunk: std::collections::VecDeque::new(),
             _phantom: PhantomData,
         };
 
@@ -161,6 +165,29 @@ where
         let record_result = match self.meta.data {
             DataKind::Ascii => Record::read_line(&mut self.reader, &self.meta.field_defs),
             DataKind::Binary => Record::read_chunk(&mut self.reader, &self.meta.field_defs),
+            #[cfg(feature = "binary_compressed")]
+            DataKind::BinaryCompressed => {
+                let mut read_result: Option<Result<Record>> = None;
+                if self.decompressed_chunk.is_empty() {
+                    if let Err(e) = Record::read_compressed_chunk(
+                        &mut self.reader,
+                        &self.meta,
+                        &mut self.decompressed_chunk,
+                    ) {
+                        read_result = Some(Err(e));
+                    }
+                }
+                match read_result {
+                    Some(err) => err,
+                    None => match Record::read_decompressed_chunk(&mut self.decompressed_chunk) {
+                        Some(record) => Ok(record),
+                        None => {
+                            self.finished = true;
+                            return None;
+                        }
+                    },
+                }
+            }
         };
 
         match record_result {

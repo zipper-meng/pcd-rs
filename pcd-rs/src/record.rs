@@ -58,6 +58,8 @@ pub struct TimestampedPoint {
 ```
 "##
 )]
+#[cfg(feature = "binary_compressed")]
+use crate::metas::PcdMeta;
 use crate::{
     error::Error,
     metas::{FieldDef, Schema, ValueKind},
@@ -66,6 +68,8 @@ use crate::{
 use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use num_traits::NumCast;
+#[cfg(feature = "binary_compressed")]
+use std::collections::VecDeque;
 use std::io::prelude::*;
 
 /// [PcdDeserialize](crate::record::PcdDeserialize) is analogous to a _point_ returned from a reader.
@@ -80,6 +84,15 @@ pub trait PcdDeserialize: Sized {
     fn read_spec() -> Vec<(Option<String>, ValueKind, Option<usize>)>;
     fn read_chunk<R: BufRead>(reader: &mut R, field_defs: &Schema) -> Result<Self>;
     fn read_line<R: BufRead>(reader: &mut R, field_defs: &Schema) -> Result<Self>;
+
+    #[cfg(feature = "binary_compressed")]
+    fn read_compressed_chunk<R: BufRead>(
+        reader: &mut R,
+        pcd_meta: &PcdMeta,
+        chunks: &mut VecDeque<Self>,
+    ) -> Result<()>;
+    #[cfg(feature = "binary_compressed")]
+    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self>;
 }
 
 /// [PcdSerialize](crate::record::PcdSerialize) is analogous to a _point_ written by a writer.
@@ -558,6 +571,102 @@ impl PcdDeserialize for DynRecord {
 
         Ok(Self(fields))
     }
+
+    #[cfg(feature = "binary_compressed")]
+    fn read_compressed_chunk<R: BufRead>(
+        reader: &mut R,
+        pcd_meta: &PcdMeta,
+        chunks: &mut VecDeque<Self>,
+    ) -> Result<()> {
+        let mut u32_bytes = [0_u8; 4];
+        reader.read_exact(&mut u32_bytes)?;
+        let compressed_len = u32::from_le_bytes(u32_bytes) as usize;
+        reader.read_exact(&mut u32_bytes)?;
+        let decompressed_len = u32::from_le_bytes(u32_bytes) as usize;
+
+        if compressed_len == 0 || decompressed_len == 0 {
+            return Ok(());
+        }
+
+        let mut compressed_data = vec![0_u8; decompressed_len];
+        reader.read_exact(&mut compressed_data[..compressed_len])?;
+        let decompressed_data =
+            lzf::decompress(&compressed_data[..compressed_len], decompressed_len)
+                .map_err(|e| Error::new_decompression_error(e))?;
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(decompressed_data));
+
+        use Field as F;
+        use ValueKind as K;
+
+        for _ in 0..pcd_meta.width {
+            let mut fields = Vec::with_capacity(pcd_meta.width as usize);
+
+            for FieldDef { kind, count, .. } in pcd_meta.field_defs.iter() {
+                let counter = 0..*count;
+
+                let field = match kind {
+                    K::I8 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_i8()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::I8(values)
+                    }
+                    K::I16 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_i16::<LittleEndian>()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::I16(values)
+                    }
+                    K::I32 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_i32::<LittleEndian>()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::I32(values)
+                    }
+                    K::U8 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_u8()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::U8(values)
+                    }
+                    K::U16 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_u16::<LittleEndian>()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::U16(values)
+                    }
+                    K::U32 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_u32::<LittleEndian>()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::U32(values)
+                    }
+                    K::F32 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_f32::<LittleEndian>()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::F32(values)
+                    }
+                    K::F64 => {
+                        let values = counter
+                            .map(|_| Ok(reader.read_f64::<LittleEndian>()?))
+                            .collect::<Result<Vec<_>>>()?;
+                        F::F64(values)
+                    }
+                };
+                fields.push(field);
+            }
+
+            chunks.push_back(DynRecord(fields));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "binary_compressed")]
+    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
+        chunks.pop_front()
+    }
 }
 
 // impl for primitive types
@@ -581,6 +690,20 @@ impl PcdDeserialize for u8 {
         reader.read_line(&mut line)?;
         Ok(line.parse()?)
     }
+
+    #[cfg(feature = "binary_compressed")]
+    fn read_compressed_chunk<R: BufRead>(
+        reader: &mut R,
+        pcd_meta: &PcdMeta,
+        chunks: &mut VecDeque<Self>,
+    ) -> Result<()> {
+        todo!("implement binary compressed")
+    }
+
+    #[cfg(feature = "binary_compressed")]
+    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
+        todo!("implement binary compressed")
+    }
 }
 
 impl PcdDeserialize for i8 {
@@ -601,6 +724,20 @@ impl PcdDeserialize for i8 {
         let mut line = String::new();
         reader.read_line(&mut line)?;
         Ok(line.parse()?)
+    }
+
+    #[cfg(feature = "binary_compressed")]
+    fn read_compressed_chunk<R: BufRead>(
+        reader: &mut R,
+        pcd_meta: &PcdMeta,
+        chunks: &mut VecDeque<Self>,
+    ) -> Result<()> {
+        todo!("implement binary compressed")
+    }
+
+    #[cfg(feature = "binary_compressed")]
+    fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
+        todo!("implement binary compressed")
     }
 }
 
@@ -624,6 +761,20 @@ macro_rules! impl_primitive {
                 let mut line = String::new();
                 reader.read_line(&mut line)?;
                 Ok(line.parse()?)
+            }
+
+            #[cfg(feature = "binary_compressed")]
+            fn read_compressed_chunk<R: BufRead>(
+                reader: &mut R,
+                pcd_meta: &PcdMeta,
+                chunks: &mut VecDeque<Self>,
+            ) -> Result<()> {
+                todo!("implement binary compressed")
+            }
+
+            #[cfg(feature = "binary_compressed")]
+            fn read_decompressed_chunk(chunks: &mut VecDeque<Self>) -> Option<Self> {
+                todo!("implement binary compressed")
             }
         }
     };
